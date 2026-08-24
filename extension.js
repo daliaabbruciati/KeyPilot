@@ -11,8 +11,40 @@ function log(...a) {
 
 function cfg() { return vscode.workspace.getConfiguration("keypilot"); }
 
+// Write a setting to BOTH user (global) and workspace scope,
+// so no matter which one is inspected the same value is returned
+async function setSetting(key, value) {
+  await cfg().update(key, value, vscode.ConfigurationTarget.Global);
+  await cfg().update(key, value, vscode.ConfigurationTarget.Workspace);
+}
+
 let statusBar, statsProvider;
 let stats = { prompt: 0, completion: 0, total: 0, requests: 0 };
+
+// --- Completion cache (LRU) + in-flight dedup + last suggestion tracking ---
+const completionCache = new Map();
+const CACHE_MAX = 40;
+let inflight = null;          // { key, promise } — request currently running
+let lastSuggestion = null;    // { uri, position, text } — for accept-next-word
+
+function cacheKey(document, position) {
+  return `${document.uri.toString()}|${document.offsetAt(position)}|${document.version}`;
+}
+
+function cacheGet(key) {
+  const v = completionCache.get(key);
+  if (v === undefined) return undefined;
+  completionCache.delete(key);
+  completionCache.set(key, v); // LRU touch
+  return v;
+}
+
+function cacheSet(key, text) {
+  completionCache.set(key, text);
+  if (completionCache.size > CACHE_MAX) {
+    completionCache.delete(completionCache.keys().next().value);
+  }
+}
 
 function fmt(n) { return n.toLocaleString("en"); }
 function updateStatusBar() {
@@ -28,7 +60,7 @@ function sleep(ms, token) {
 }
 
 async function saveApiKey(key) {
-  await cfg().update("apiKey", key.trim(), vscode.ConfigurationTarget.Global);
+  await setSetting("apiKey", key.trim());
   vscode.window.showInformationMessage("KeyPilot: API Key saved.");
 }
 
@@ -40,6 +72,53 @@ async function promptForApiKey() {
     password: true
   });
   if (input?.trim()) { await saveApiKey(input); statsProvider?.refresh(); }
+}
+
+async function promptForModel() {
+  const current = cfg().get("model") || "";
+  const input = await vscode.window.showInputBox({
+    prompt: "Model name (e.g. gemini-3.1-flash-lite, llama-3.3-70b-versatile)",
+    placeHolder: current || "gemini-3.1-flash-lite",
+    ignoreFocusOut: true,
+    value: current
+  });
+  if (input?.trim() && input.trim() !== current) {
+    await setSetting("model", input.trim());
+    vscode.window.showInformationMessage(`KeyPilot: model set to ${input.trim()}.`);
+    statsProvider?.refresh();
+  }
+}
+
+// --- Error toasts (throttled: same error not repeated within cooldown) ---
+const TOAST_COOLDOWN = 30000;
+const lastToastAt = new Map();
+
+function showError(key, message, ...actions) {
+  const now = Date.now();
+  if (now - (lastToastAt.get(key) ?? 0) < TOAST_COOLDOWN) return;
+  lastToastAt.set(key, now);
+  vscode.window.showErrorMessage(`KeyPilot: ${message}`, ...actions.map(a => a.label))
+    .then(pick => actions.find(a => a.label === pick)?.run());
+}
+
+// Map HTTP status codes to user-friendly messages with quick-fix actions
+function httpError(status, model) {
+  switch (status) {
+    case 401:
+    case 403:
+      return ["Invalid API Key. Check your credentials.", { label: "Change API Key", run: promptForApiKey }];
+    case 404:
+      return [`Model "${model}" not found. Check the exact model name for your provider.`, { label: "Change Model", run: promptForModel }];
+    case 429:
+      return ["Rate limit reached: quota exhausted. Wait or switch model / API Key.",
+        { label: "Change API Key", run: promptForApiKey }, { label: "Change Model", run: promptForModel }];
+    case 400:
+      return ["Bad request: check the model name and endpoint URL.", { label: "Change Model", run: promptForModel }];
+    case 500: case 502: case 503:
+      return ["Provider is temporarily unavailable. Try again in a moment."];
+    default:
+      return [`Request failed (HTTP ${status}).`];
+  }
 }
 
 async function promptForApiKeyStartup() {
@@ -85,16 +164,22 @@ function makeItem(document, position, text) {
   );
 }
 
-async function getCompletion(document, position, token) {
+async function getCompletion(document, position, ctx, token) {
   const c = cfg();
   if (!c.get("enabled")) return null;
   const apiKey = c.get("apiKey");
   if (!apiKey?.trim()) return null;
 
-  if (token) {
-    if (!await sleep(200, token)) return null;
-    if (token.isCancellationRequested) return null;
-  }
+  // Instant response if we already completed this exact spot
+  const key = cacheKey(document, position);
+  const cached = cacheGet(key);
+  if (cached !== undefined) return cached;
+
+  // Debounce rapid typing; manual triggers (Invoke) fire immediately
+  const invoke = ctx?.triggerKind === vscode.InlineCompletionTriggerKind.Invoke;
+  const ms = invoke ? 0 : (c.get("debounceMs") ?? 50);
+  if (ms > 0 && !await sleep(ms, token)) return null;
+  if (token?.isCancellationRequested) return null;
 
   const maxBefore = c.get("maxContextChars") || 3000;
   const maxAfter = Math.round(maxBefore / 5);
@@ -128,10 +213,17 @@ async function getCompletion(document, position, token) {
       }),
       signal: controller.signal,
     });
-  } catch (e) { log("fetch error", e.name, e.message); return null; }
+  } catch (e) {
+    if (e.name === "AbortError") return null; // cancelled by a newer keystroke
+    log("fetch error", e.name, e.message);
+    showError("network", "Cannot reach the endpoint. Check your connection or the endpoint URL.");
+    return null;
+  }
 
   if (!resp.ok) {
     log("http error", resp.status, (await resp.text().catch(() => "")).slice(0, 200));
+    const [message, ...actions] = httpError(resp.status, c.get("model"));
+    showError(`http-${resp.status}`, message, ...actions);
     return null;
   }
 
@@ -157,8 +249,32 @@ async function getCompletion(document, position, token) {
   }
 
   if (!text.trim()) return null;
+  cacheSet(key, text);
   log("ok", text.slice(0, 80).replace(/\n/g, "\\n"));
   return text;
+}
+
+// Run a completion, deduplicating identical concurrent requests
+async function requestCompletion(document, position, ctx, token) {
+  const key = cacheKey(document, position);
+  if (inflight && inflight.key === key) return inflight.promise;
+  const p = getCompletion(document, position, ctx, token);
+  inflight = { key, promise: p };
+  try {
+    return await p;
+  } finally {
+    if (inflight?.promise === p) inflight = null;
+  }
+}
+
+// Extract the next word-sized chunk of the suggestion (Copilot-style partial accept)
+function nextChunk(text) {
+  const ws = text.match(/^\s+/)?.[0] ?? "";
+  const rest = text.slice(ws.length);
+  if (!rest) return ws;
+  const word = rest.match(/^[\w$]+|^[^\s\w$]/)?.[0] ?? rest[0];
+  const tail = rest.slice(word.length).match(/^[ \t]+/)?.[0] ?? "";
+  return ws + word + tail;
 }
 
 async function makeDummyCall() {
@@ -213,6 +329,27 @@ async function makeDummyCall() {
   }
 }
 
+// Real autocomplete test: runs an actual completion on the active editor
+async function runCompletionTest() {
+  const post = res => statsProvider?._view?.webview.postMessage(res);
+  const ed = vscode.window.activeTextEditor;
+  if (!ed) { post({ type: "testResult", ok: false, error: "Open a file first." }); return; }
+  if (!cfg().get("apiKey")?.trim()) { post({ type: "testResult", ok: false, error: "API Key not set." }); return; }
+
+  const t0 = Date.now();
+  try {
+    const text = await getCompletion(
+      ed.document, ed.selection.active,
+      { triggerKind: vscode.InlineCompletionTriggerKind.Invoke }, undefined
+    );
+    const ms = Date.now() - t0;
+    if (text) post({ type: "testResult", ok: true, ms, preview: text.slice(0, 140) });
+    else post({ type: "testResult", ok: false, ms: Date.now() - t0, error: "No suggestion returned. Check model name / key." });
+  } catch (e) {
+    post({ type: "testResult", ok: false, error: e.message });
+  }
+}
+
 class StatsViewProvider {
   constructor(extensionUri) { this._view = null; this._extensionUri = extensionUri; }
 
@@ -224,14 +361,18 @@ class StatsViewProvider {
     view.webview.onDidReceiveMessage(async msg => {
       switch (msg.command) {
         case "setApiKey":   await promptForApiKey(); break;
-        case "setContext":  await cfg().update("maxContextChars", Number(msg.value), vscode.ConfigurationTarget.Global); break;
-        case "toggleEnabled": await cfg().update("enabled", msg.value, vscode.ConfigurationTarget.Global); break;
+        case "setModel":    await promptForModel(); break;
+        case "setContext":  await setSetting("maxContextChars", Number(msg.value)); break;
+        case "toggleEnabled": await setSetting("enabled", msg.value); break;
         case "resetTokens":
           stats = { prompt: 0, completion: 0, total: 0, requests: 0 };
           updateStatusBar(); this.refresh();
           break;
         case "dummyCall":
           await makeDummyCall();
+          break;
+        case "testCompletion":
+          await runCompletionTest();
           break;
       }
     });
@@ -244,6 +385,7 @@ class StatsViewProvider {
     const masked = key.length > 8 ? `${key.slice(0, 6)}••••${key.slice(-2)}` : key ? "••••••" : "Not set";
     this._view.webview.postMessage({
       type: "update", stats, masked,
+      model: c.get("model") ?? "",
       context: c.get("maxContextChars") ?? 3000,
       enabled: c.get("enabled") ?? true,
     });
@@ -254,6 +396,7 @@ class StatsViewProvider {
     const key = c.get("apiKey") || "";
     const masked = key.length > 8 ? `${key.slice(0, 6)}••••${key.slice(-2)}` : key ? "••••••" : "Not set";
     const context = c.get("maxContextChars") ?? 3000;
+    const model = c.get("model") ?? "";
     const enabled = c.get("enabled") ?? true;
     const pct = stats.total ? Math.round(stats.completion / stats.total * 100) : 0;
 
@@ -459,6 +602,60 @@ body{
   color:#FF3B30;
   border-color:rgba(255,59,48,.3);
 }
+
+/* Big autocomplete test button */
+.test-btn{
+  width:100%;
+  margin-top:20px;
+  background:linear-gradient(135deg,#007AFF,#34C8F5);
+  color:#fff;
+  border:none;
+  padding:16px 18px;
+  font-size:15px;font-weight:600;
+  letter-spacing:.02em;
+  cursor:pointer;
+  border-radius:14px;
+  font-family:inherit;
+  text-align:left;
+  position:relative;
+  overflow:hidden;
+  box-shadow:0 4px 16px rgba(0,122,255,.35);
+  transition:transform .15s cubic-bezier(.4,0,.2,1),box-shadow .25s,opacity .2s;
+}
+.test-btn:hover{ transform:translateY(-2px); box-shadow:0 8px 24px rgba(0,122,255,.5); }
+.test-btn:active{ transform:translateY(0) scale(.99); }
+.test-btn:disabled{ opacity:.65; cursor:default; transform:none; }
+.test-btn .sub{ display:block; font-size:11px; font-weight:400; opacity:.85; margin-top:3px; letter-spacing:.04em; }
+.test-btn .icon{
+  position:absolute; right:14px; top:50%; transform:translateY(-50%);
+  font-size:22px; opacity:.9;
+}
+.test-btn.testing .icon{ animation:spin 1s linear infinite; display:inline-block; }
+@keyframes spin{ to{ transform:translateY(-50%) rotate(360deg); } }
+/* shimmer sweep while testing */
+.test-btn::after{
+  content:''; position:absolute; inset:0;
+  background:linear-gradient(105deg,transparent 40%,rgba(255,255,255,.25) 50%,transparent 60%);
+  transform:translateX(-100%);
+}
+.test-btn.testing::after{ animation:sweep 1.1s ease-in-out infinite; }
+@keyframes sweep{ to{ transform:translateX(100%); } }
+
+.test-result{
+  margin-top:10px;
+  background:rgba(128,128,128,.07);
+  border-radius:10px;
+  padding:10px 13px;
+  font-size:12px;
+  line-height:1.5;
+  display:none;
+  word-break:break-word;
+}
+.test-result.ok{ display:block; border-left:2.5px solid #34C759; }
+.test-result.err{ display:block; border-left:2.5px solid #FF3B30; }
+.test-result b{ font-weight:600; }
+.test-result .prev{ opacity:.7; white-space:pre-wrap; }
+
 </style></head><body>
 
 <div class="header">
@@ -493,6 +690,12 @@ body{
 </div>
 
 <div class="srow">
+  <span class="srow-name">Model</span>
+  <span class="srow-val" id="model">${model}</span>
+  <button class="pill" onclick="p({command:'setModel'})">Change</button>
+</div>
+
+<div class="srow">
   <span class="srow-name">Context</span>
   <input class="num-input" type="number" id="ctx" value="${context}" min="500" max="50000" step="500"
     onchange="p({command:'setContext',value:this.value})">
@@ -514,6 +717,13 @@ body{
   <button class="reset" style="flex:1" onclick="p({command:'dummyCall'})">Test Token Consumption</button>
 </div>
 
+<button class="test-btn" id="testBtn" onclick="runTest()">
+  <span id="testLabel">Test Autocomplete</span>
+  <span class="sub">Runs a real completion on the active file</span>
+  <span class="icon" id="testIcon">⚡</span>
+</button>
+<div class="test-result" id="testResult"></div>
+
 <script>
 const vsc = acquireVsCodeApi();
 function p(m){vsc.postMessage(m)}
@@ -530,8 +740,37 @@ function toggleEnabled(){
   p({command:'toggleEnabled',value:_enabled});
 }
 
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function runTest(){
+  const b=document.getElementById('testBtn');
+  const r=document.getElementById('testResult');
+  b.disabled=true;
+  b.classList.add('testing');
+  document.getElementById('testLabel').textContent='Testing…';
+  document.getElementById('testIcon').textContent='◌';
+  r.className='test-result';
+  p({command:'testCompletion'});
+}
+
 window.addEventListener('message',e=>{
   const m=e.data;
+  if(m.type==='testResult'){
+    const b=document.getElementById('testBtn');
+    const r=document.getElementById('testResult');
+    b.disabled=false;
+    b.classList.remove('testing');
+    document.getElementById('testLabel').textContent='Test Autocomplete';
+    document.getElementById('testIcon').textContent='⚡';
+    r.style.display='block';
+    if(m.ok){
+      r.className='test-result ok';
+      r.innerHTML='<b>✓ Working</b> · '+m.ms+' ms<br><span class="prev">'+esc(m.preview)+'</span>';
+    } else {
+      r.className='test-result err';
+      r.innerHTML='<b>✗ Failed</b>'+(m.ms?' · '+m.ms+' ms':'')+'<br><span class="prev">'+esc(m.error||'Unknown error')+'</span>';
+    }
+    return;
+  }
   if(m.type!=='update')return;
   const s=m.stats;
   document.getElementById('total').textContent=fmt(s.total);
@@ -540,6 +779,7 @@ window.addEventListener('message',e=>{
   document.getElementById('compl').textContent=fmt(s.completion);
   document.getElementById('bar').style.width=(s.total?Math.round(s.completion/s.total*100):0)+'%';
   document.getElementById('masked').textContent=m.masked;
+  document.getElementById('model').textContent=m.model;
   document.getElementById('ctx').value=m.context;
   _enabled=m.enabled;
   document.getElementById('togTrack').className='tog-track'+(m.enabled?' on':'');
@@ -569,8 +809,9 @@ function activate(context) {
   const provider = {
     async provideInlineCompletionItems(document, position, ctx, token) {
       if (ctx.triggerKind === vscode.InlineCompletionTriggerKind.Automatic && position.character === 0) return null;
-      const text = await getCompletion(document, position, token);
+      const text = await requestCompletion(document, position, ctx, token);
       if (!text || token?.isCancellationRequested) return null;
+      lastSuggestion = { uri: document.uri.toString(), position, text };
       return [makeItem(document, position, text)];
     },
   };
@@ -581,6 +822,24 @@ function activate(context) {
     vscode.commands.registerCommand("keypilot.openStats", () =>
       vscode.commands.executeCommand("workbench.view.extension.keypilot")),
     vscode.commands.registerCommand("keypilot.setApiKey", promptForApiKey),
+    vscode.commands.registerCommand("keypilot.setModel", promptForModel),
+    vscode.commands.registerCommand("keypilot.trigger", () =>
+      vscode.commands.executeCommand("editor.action.inlineSuggest.trigger")),
+    vscode.commands.registerCommand("keypilot.acceptNextWord", async () => {
+      const ed = vscode.window.activeTextEditor;
+      if (!ed || !lastSuggestion) return;
+      const pos = ed.selection.active;
+      const s = lastSuggestion;
+      if (s.uri !== ed.document.uri.toString() ||
+          pos.line !== s.position.line || pos.character !== s.position.character) return;
+      const chunk = nextChunk(s.text);
+      if (!chunk) return;
+      await ed.edit(eb => eb.insert(pos, chunk));
+      const remaining = s.text.slice(chunk.length);
+      lastSuggestion = remaining.trim()
+        ? { uri: s.uri, position: pos.translate(0, chunk.length), text: remaining }
+        : null;
+    }),
     vscode.commands.registerCommand("keypilot.resetTokens", () => {
       stats = { prompt: 0, completion: 0, total: 0, requests: 0 };
       updateStatusBar();
