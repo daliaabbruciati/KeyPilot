@@ -2,7 +2,7 @@
   "name": "keypilot",
   "displayName": "KeyPilot",
   "description": "Inline code completion powered by Gemini (or any OpenAI-compatible API)",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "publisher": "local",
   "icon": "logo-1.png",
   "engines": {
@@ -62,14 +62,35 @@
           "type": "number",
           "default": 3000,
           "description": "Chars of code before cursor sent as context. After-cursor uses 1/5 of this value."
+        },
+        "keypilot.debounceMs": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "description": "Delay in ms before a suggestion is requested while typing. Lower = more reactive."
         }
       }
     },
+    "keybindings": [
+      {
+        "command": "keypilot.trigger",
+        "key": "alt+\\",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "keypilot.acceptNextWord",
+        "key": "ctrl+right",
+        "when": "inlineSuggestionVisible"
+      }
+    ],
     "commands": [
       { "command": "keypilot.test", "title": "Keypilot: Test Completion" },
       { "command": "keypilot.setApiKey", "title": "Keypilot: Set API Key" },
+      { "command": "keypilot.setModel", "title": "Keypilot: Set Model" },
       { "command": "keypilot.resetTokens", "title": "Keypilot: Reset Token Counter" },
-      { "command": "keypilot.openStats", "title": "Keypilot: Open Stats" }
+      { "command": "keypilot.openStats", "title": "Keypilot: Open Stats" },
+      { "command": "keypilot.trigger", "title": "Keypilot: Trigger Suggestion" },
+      { "command": "keypilot.acceptNextWord", "title": "Keypilot: Accept Next Word Of Suggestion" }
     ]
   }
 }
